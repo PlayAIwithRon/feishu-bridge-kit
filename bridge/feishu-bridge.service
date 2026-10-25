@@ -1,0 +1,14 @@
+[Unit]
+Description=Feishu two-way bridge listener (long connection / websocket)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/feishu-bridge
+ExecStart=%h/workspace/feishu-bridge/venv/bin/python %h/workspace/feishu-bridge/listener.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
