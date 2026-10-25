@@ -1,0 +1,11 @@
+# 真实凭证与运行时文件 —— 永远不要提交
+bridge/config.json
+bridge/webhook.json
+bridge/watch-state.json
+bridge/inbox.jsonl
+bridge/proxy.env
+*.log
+__pycache__/
+.venv/
+venv/
+.env
