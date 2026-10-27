@@ -6,7 +6,7 @@
 
 1. 电脑浏览器打开 https://open.feishu.cn → 开发者后台 → 创建应用 → 企业自建应用，名称随意（比如「我的助手」）。
 2. 应用内左侧「应用能力」→ 添加能力 → 启用「机器人」。
-3. 左侧「权限管理」，搜索「消息」，开通：接收消息、发送消息相关的权限。
+3. 左侧「权限管理」，搜索「消息」，开通：接收消息、发送消息相关的权限。v2 的断线补收还要调「获取会话历史消息」（`GET /open-apis/im/v1/messages`），用的就是同一组消息读取权限——开通时确认包含读取单聊/群聊历史消息的权限即可，不用额外申请。
 4. 左侧「凭证与基础信息」，记下 **App ID** 和 **App Secret** —— 这就是你的全部凭证，自己保管，不要发给任何人。
 5. 「事件与回调」和「版本管理与发布」**先别动**，等第 3 步监听跑起来再回来（原因见 README 的“坑”）。
 
@@ -58,7 +58,22 @@ chmod 600 config.json
    ```
    飞书里收到这句 = 发通了。双向桥完工。
 
-## 第 6 步（可选）：单向汇报通道
+## 第 6 步：断线补收（v2 自带，建议验证一次）
+
+`listener.py` v2 已内置补收线程（启动 10 秒后首跑、之后每 120 秒一次，间隔用环境变量 `FEISHU_BACKFILL_INTERVAL_SECS` 调，设 0 关闭），一般不用额外配置。验证它真的有效：
+
+```bash
+cd ~/workspace/feishu-bridge
+# 先看一次只报告不动手的扫描（窗口 72 小时）
+./venv/bin/python backfill.py --hours 72 --dry-run
+# 期望：recovered=0（没有丢失时）。若想实测捞回：临时从 inbox.jsonl
+# 删掉最后一条用户消息，再去掉 --dry-run 跑一次，应正好补回 1 条，
+# 且 tail inbox.jsonl 能看到 "source": "backfill"；再跑一次应为 0 条。
+```
+
+手动补某个会话：`./venv/bin/python backfill.py --chat-id oc_xxx --hours 48`。补收状态看 `bridge-status.json` / `bridge-state.json`（运行时文件，不要提交仓库）。注意边界：只能补「桥认识的会话」（id 学自历史消息），全新会话的第一条若正好发在断线期仍会漏，细节见 README 的 v2 更新一节。
+
+## 第 7 步（可选）：单向汇报通道
 
 想让系统往某个飞书群推格式化报告：群设置 → 群机器人 → 添加自定义机器人 → 拿到 webhook URL → `cp webhook.json.example webhook.json`，把 URL 填进 `url` 字段，`chmod 600 webhook.json`。发送：
 
@@ -67,7 +82,7 @@ chmod 600 config.json
 # severity: urgent=🔴 / action=🟡 / info=🟢 ；成功输出 FEISHU_OK
 ```
 
-## 第 7 步（可选）：接上你的 agent
+## 第 8 步（可选）：接上你的 agent
 
 把 `agent-integration/` 接到你的 agent 框架上：
 
@@ -83,3 +98,4 @@ chmod 600 config.json
 | 能连上但收不到消息 | 事件没订阅「接收消息」，或应用版本没发布 |
 | reply.py 报权限错误 | 应用没开「发送消息」权限，或改完权限没重新发布版本 |
 | 服务重启后不见了 | 单元文件放在了会被回收的位置；把模板和配置都留在持久目录，并准备一键重装脚本 |
+| 断线期间发的消息没收到 | v2 起先看 bridge-status.json 的 last_backfill_result；补收只覆盖已知会话，手动跑一次 `backfill.py --hours 72 --dry-run` 看能捞回几条；若报权限错误，是历史消息读取权限没开或版本没重新发布 |
