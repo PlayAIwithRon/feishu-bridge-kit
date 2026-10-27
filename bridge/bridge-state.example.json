@@ -1,0 +1,1 @@
+{"note": "Backfill runtime state (known chats + last run). Copy to bridge-state.json to start empty; backfill.py maintains the real one automatically. Never commit the real file.", "known_chat_ids": [], "last_backfill_at": null}

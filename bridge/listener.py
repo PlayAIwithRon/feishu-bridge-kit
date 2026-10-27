@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
-"""Feishu two-way bridge: long-connection (websocket) event listener.
+"""Feishu two-way bridge: long-connection (websocket) event listener. v2
 
 Connects to Feishu with lark-oapi's ws client (no public URL needed),
 handles `im.message.receive_v1` events, and appends one JSON line per
 event to inbox.jsonl next to this file.
+
+v2 adds disconnect recovery (see backfill.py): a background thread runs
+a history backfill shortly after startup and then on an interval
+(default 120s, env FEISHU_BACKFILL_INTERVAL_SECS, 0 = disabled). Any
+user message that was sent while this listener was disconnected is
+recovered from the chat-history API and appended to inbox.jsonl with
+"source": "backfill". Incoming events are also deduplicated by
+message_id (in memory, seeded from inbox.jsonl), so the live push and
+the backfill can never write the same message twice.
+
+The thread also refreshes bridge-status.json on every pass
+(last_backfill_at / last result), so a watchdog can tell at a glance
+whether recovery is healthy.
 
 Credentials come from config.json in the same directory:
     {"app_id": "...", "app_secret": "..."}
@@ -15,6 +28,8 @@ immediately with a clear error (exit code 2) instead of crash-looping.
 import json
 import os
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,8 +64,11 @@ except Exception as _patch_exc:  # never let the patch itself kill the listener
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 INBOX_PATH = BASE_DIR / "inbox.jsonl"
+STATUS_PATH = BASE_DIR / "bridge-status.json"
 
 PLACEHOLDER_MARKERS = ("", "your_app_id", "your_app_secret", "cli_xxx", "placeholder")
+
+BACKFILL_INTERVAL_SECS = int(os.environ.get("FEISHU_BACKFILL_INTERVAL_SECS", "120"))
 
 
 def log(msg: str) -> None:
@@ -85,6 +103,39 @@ def load_config() -> dict:
     return {"app_id": app_id, "app_secret": app_secret}
 
 
+# --- inbox dedupe ------------------------------------------------------------
+_seen_lock = threading.Lock()
+_seen_ids: set[str] = set()
+
+
+def _seed_seen_ids() -> None:
+    if not INBOX_PATH.exists():
+        return
+    for line in INBOX_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            mid = json.loads(line).get("message_id")
+        except json.JSONDecodeError:
+            continue
+        if mid:
+            _seen_ids.add(mid)
+
+
+def _append_record(record: dict) -> bool:
+    """Append to inbox.jsonl unless this message_id is already there."""
+    mid = record.get("message_id") or ""
+    with _seen_lock:
+        if mid and mid in _seen_ids:
+            return False
+        with INBOX_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if mid:
+            _seen_ids.add(mid)
+    return True
+
+
 def on_message_receive(data) -> None:
     """Handle one P2ImMessageReceiveV1 event: record it in inbox.jsonl."""
     try:
@@ -113,17 +164,72 @@ def on_message_receive(data) -> None:
             "sender_open_id": sender_open_id,
             "msg_type": msg_type,
             "text": text,
+            "source": "websocket",
         }
-        with INBOX_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        log(f"inbox <- {record['message_id']} chat={record['chat_id']} "
-            f"from={sender_open_id} type={msg_type} text={text!r}")
+        if _append_record(record):
+            log(f"inbox <- {record['message_id']} chat={record['chat_id']} "
+                f"from={sender_open_id} type={msg_type} text={text!r}")
+        else:
+            log(f"inbox: duplicate event skipped: {record['message_id']}")
     except Exception as exc:  # never let one bad event kill the listener
         log(f"WARN: failed to record event: {exc}")
 
 
+# --- backfill thread ---------------------------------------------------------
+
+def _write_status(fields: dict) -> None:
+    try:
+        current = {}
+        if STATUS_PATH.exists():
+            try:
+                current = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                current = {}
+        current.update(fields)
+        STATUS_PATH.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        log(f"WARN: cannot write bridge-status.json: {exc}")
+
+
+def _backfill_loop() -> None:
+    """Recover missed messages forever: first pass after 10s, then periodic.
+
+    Runs in a daemon thread; a failure here must never take the listener
+    down, so every pass is wrapped and logged.
+    """
+    if BACKFILL_INTERVAL_SECS <= 0:
+        log("backfill disabled (FEISHU_BACKFILL_INTERVAL_SECS=0)")
+        return
+    try:
+        import backfill
+    except Exception as exc:
+        log(f"WARN: backfill module unavailable, recovery disabled: {exc}")
+        return
+    time.sleep(10)
+    while True:
+        try:
+            result = backfill.run_backfill(base_dir=BASE_DIR)
+            # Pick up ids the backfill just wrote, so the live handler
+            # dedupes against them too.
+            with _seen_lock:
+                ids, _ = backfill.read_inbox(BASE_DIR)
+                _seen_ids.update(ids)
+            _write_status({
+                "listener": "running",
+                "last_backfill_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                "last_backfill_result": result,
+            })
+        except SystemExit:
+            log("WARN: backfill pass skipped (config not ready)")
+        except Exception as exc:
+            log(f"WARN: backfill pass failed: {exc}")
+            _write_status({"last_backfill_error": str(exc)})
+        time.sleep(BACKFILL_INTERVAL_SECS)
+
+
 def main() -> int:
     cfg = load_config()
+    _seed_seen_ids()
 
     import lark_oapi as lark
 
@@ -139,7 +245,13 @@ def main() -> int:
         event_handler=handler,
         log_level=lark.LogLevel.INFO,
     )
-    log("listener starting (long connection / websocket mode); inbox: %s" % INBOX_PATH)
+    _write_status({
+        "listener": "starting",
+        "started_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "backfill_interval_secs": BACKFILL_INTERVAL_SECS,
+    })
+    threading.Thread(target=_backfill_loop, name="backfill", daemon=True).start()
+    log("listener starting (long connection / websocket mode, v2 with backfill); inbox: %s" % INBOX_PATH)
     client.start()  # blocks; the ws client auto-reconnects
     return 0
 
