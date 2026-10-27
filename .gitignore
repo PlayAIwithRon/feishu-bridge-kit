@@ -2,6 +2,8 @@
 bridge/config.json
 bridge/webhook.json
 bridge/watch-state.json
+bridge/bridge-state.json
+bridge/bridge-status.json
 bridge/inbox.jsonl
 bridge/proxy.env
 *.log
